@@ -1,416 +1,340 @@
+"""
+Полноценная модель с эмбеддингами новостей (SBERT) и взвешенной агрегацией
+"""
+
 import sqlite3
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, f1_score, accuracy_score
+from sklearn.metrics import classification_report, f1_score
 import lightgbm as lgb
 import warnings
-import os
 warnings.filterwarnings('ignore')
 
+# Установка sentence-transformers если ещё нет
+# pip install sentence-transformers
+
+from sentence_transformers import SentenceTransformer
+
+# ============================================================
+# 1. ЗАГРУЗКА ДАННЫХ
+# ============================================================
+
 class DataLoader:
-    """Загружает данные для любого набора инструментов из БД"""
-    
-    def __init__(self, market_db_path, news_db_path=None):
+    def __init__(self, market_db_path, news_db_path):
         self.market_conn = sqlite3.connect(market_db_path)
-        self.news_conn = sqlite3.connect(news_db_path) if news_db_path and os.path.exists(news_db_path) else None
-        
-    def list_available_tables(self):
-        cursor = self.market_conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = cursor.fetchall()
-        return [t[0] for t in tables]
+        self.news_conn = sqlite3.connect(news_db_path)
     
-    def load_instrument(self, table_name, start_date=None, end_date=None):
-        query = f"SELECT datetime, open, high, low, close, volume FROM {table_name}"
-        df = pd.read_sql_query(query, self.market_conn)
-        
+    def load_market_data(self, ticker='sber'):
+        df = pd.read_sql_query(f"""
+            SELECT datetime, open, high, low, close, volume 
+            FROM {ticker}_5min 
+            ORDER BY datetime
+        """, self.market_conn)
         df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.sort_values('datetime').reset_index(drop=True)
-        
-        if start_date:
-            df = df[df['datetime'] >= start_date]
-        if end_date:
-            df = df[df['datetime'] <= end_date]
-        
-        # Извлекаем имя инструмента (sber, gold, imoex, usd_rub)
-        instrument_name = table_name.replace('_5min', '').replace('_1min', '')
-        
-        # Переименовываем колонки
-        df = df.rename(columns={
-            'open': f'{instrument_name}_open',
-            'high': f'{instrument_name}_high',
-            'low': f'{instrument_name}_low',
-            'close': f'{instrument_name}_close',
-            'volume': f'{instrument_name}_volume'
-        })
-        
-        return df[['datetime', f'{instrument_name}_open', f'{instrument_name}_high', 
-                   f'{instrument_name}_low', f'{instrument_name}_close', f'{instrument_name}_volume']]
-    
-    def load_all_instruments(self, table_names, start_date=None, end_date=None):
-        all_data = {}
-        
-        for table in table_names:
-            try:
-                df = self.load_instrument(table, start_date, end_date)
-                instrument_name = table.replace('_5min', '').replace('_1min', '')
-                all_data[instrument_name] = df
-                print(f" {instrument_name}: {len(df)} записей")
-            except Exception as e:
-                print(f" Ошибка загрузки {table}: {e}")
-        
-        if not all_data:
-            raise ValueError("Не удалось загрузить ни один инструмент")
-        
-        # Объединяем по datetime
-        merged = None
-        for name, df in all_data.items():
-            if merged is None:
-                merged = df
-            else:
-                merged = merged.merge(df, on='datetime', how='inner')
-        
-        merged = merged.sort_values('datetime').reset_index(drop=True)
-        
-        print(f"  После объединения: {len(merged)} строк")
-        print(f"  Колонки: {list(merged.columns)}")
-        
-        return merged, list(all_data.keys())
+        return df
     
     def load_news(self, start_date=None, end_date=None):
-        if self.news_conn is None:
-            return pd.DataFrame()
-        
-        query = "SELECT id, title, published, full_text, tags FROM news"
-        news_df = pd.read_sql_query(query, self.news_conn)
-        
-        news_df['published'] = pd.to_datetime(news_df['published'])
-        news_df = news_df.sort_values('published').reset_index(drop=True)
+        news = pd.read_sql_query("""
+            SELECT id, title, published, full_text, tags 
+            FROM news
+        """, self.news_conn)
+        news['published'] = pd.to_datetime(news['published'])
+        news['text'] = news['title'] + '. ' + news['full_text'].fillna('')
         
         if start_date:
-            news_df = news_df[news_df['published'] >= start_date]
+            news = news[news['published'] >= start_date]
         if end_date:
-            news_df = news_df[news_df['published'] <= end_date]
+            news = news[news['published'] <= end_date]
         
-        news_df['text'] = news_df['title'].fillna('') + '. ' + news_df['full_text'].fillna('')
-        
-        print(f" Новости: {len(news_df)} записей")
-        return news_df
+        return news
     
     def close(self):
         self.market_conn.close()
-        if self.news_conn:
-            self.news_conn.close()
+        self.news_conn.close()
+
+
+# ============================================================
+# 2. ЭМБЕДДИНГИ НОВОСТЕЙ (SBERT)
+# ============================================================
+
+class NewsEmbedder:
+    """
+    Преобразование новостей в эмбеддинги с помощью SBERT
+    """
+    
+    def __init__(self, model_name='intfloat/multilingual-e5-large'):
+        print(f" Загрузка модели {model_name}...")
+        self.model = SentenceTransformer(model_name)
+        print("   Модель загружена")
+    
+    def get_embeddings(self, texts, batch_size=32):
+        """
+        Получает эмбеддинги для списка текстов
+        """
+        print(f"   Вычисление эмбеддингов для {len(texts)} новостей...")
+        
+        # Для модели e5 нужен префикс
+        texts_with_prefix = [f"passage: {t[:512]}" for t in texts]
+        
+        embeddings = self.model.encode(
+            texts_with_prefix, 
+            batch_size=batch_size,
+            show_progress_bar=True,
+            normalize_embeddings=True
+        )
+        
+        return embeddings
+    
+    def get_embeddings_for_news(self, news_df):
+        """
+        Добавляет колонку с эмбеддингами в DataFrame новостей
+        """
+        texts = news_df['text'].fillna('').tolist()
+        embeddings = self.get_embeddings(texts)
+        
+        news_df = news_df.copy()
+        news_df['embedding'] = list(embeddings)
+        
+        return news_df
+
+
+# ============================================================
+# 3. ВЗВЕШЕННАЯ АГРЕГАЦИЯ ЭМБЕДДИНГОВ
+# ============================================================
+
+class WeightedNewsAggregator:
+    """
+    Агрегирует эмбеддинги новостей с экспоненциальным взвешиванием
+    Более свежие новости имеют больший вес
+    """
+    
+    def __init__(self, decay_minutes=30):
+        """
+        decay_minutes: период полураспада веса (в минутах)
+        """
+        self.decay_minutes = decay_minutes
+    
+    def _get_weights(self, news_times, current_time):
+        """
+        Рассчитывает веса для новостей на основе их возраста
+        """
+        time_diff = (current_time - news_times).dt.total_seconds() / 60
+        decay_rate = np.log(2) / self.decay_minutes
+        weights = np.exp(-decay_rate * np.maximum(time_diff, 0))
+        return weights
+    
+    def aggregate_embeddings(self, news_batch, current_time):
+        """
+        Агрегирует эмбеддинги с экспоненциальным взвешиванием
+        Возвращает: 
+        - взвешенное среднее эмбеддинга
+        - сумму весов (интенсивность)
+        - максимальный вес (свежесть самой свежей новости)
+        """
+        if len(news_batch) == 0:
+            # Пустой эмбеддинг (нулевой вектор)
+            return np.zeros(768), 0.0, 0.0
+        
+        embeddings = np.vstack(news_batch['embedding'].values)
+        weights = self._get_weights(news_batch['published'], current_time)
+        
+        total_weight = weights.sum()
+        if total_weight > 0:
+            weighted_avg = np.average(embeddings, weights=weights, axis=0)
+            max_weight = weights.max()
+        else:
+            weighted_avg = np.mean(embeddings, axis=0)
+            max_weight = 0.0
+        
+        return weighted_avg, total_weight, max_weight
+    
+    def aggregate_sentiment(self, news_batch, current_time):
+        """
+        Агрегирует сентимент с тем же взвешиванием
+        """
+        if len(news_batch) == 0:
+            return 0.0, 0.0, 0.0
+        
+        # Простой сентимент на основе ключевых слов
+        pos_words = ['рост', 'вырос', 'увеличился', 'прибыль', 'позитив', 'хороший', 'рекорд']
+        neg_words = ['падение', 'упал', 'снижение', 'убыток', 'негатив', 'плохой', 'кризис']
+        
+        sentiments = []
+        for _, row in news_batch.iterrows():
+            text = row['text'].lower()
+            pos_count = sum(text.count(w) for w in pos_words)
+            neg_count = sum(text.count(w) for w in neg_words)
+            sent = (pos_count - neg_count) / (pos_count + neg_count + 1)
+            sentiments.append(sent)
+        
+        sentiments = np.array(sentiments)
+        weights = self._get_weights(news_batch['published'], current_time)
+        
+        total_weight = weights.sum()
+        if total_weight > 0:
+            weighted_sentiment = np.average(sentiments, weights=weights)
+        else:
+            weighted_sentiment = np.mean(sentiments)
+        
+        return weighted_sentiment, total_weight, weights.max()
+
+
+# ============================================================
+# 4. ПОСТРОЕНИЕ ПРИЗНАКОВ ДЛЯ МОДЕЛИ
+# ============================================================
 
 class FeatureBuilder:
     """
-    Строит признаки для набора инструментов
+    Строит признаки для модели: рыночные + новостные (эмбеддинги)
     """
     
-    def __init__(self, target_name):
+    def __init__(self, ticker='sber', embedding_dim=768):
+        self.ticker = ticker
+        self.embedding_dim = embedding_dim
+        self.aggregator = WeightedNewsAggregator(decay_minutes=30)
+        self.embedder = None  # будет инициализирован позже
+    
+    def add_market_features(self, df):
         """
-        Parameters:
-        -----------
-        target_name : str
-            Название инструмента, который предсказываем (например, 'sber')
-        """
-        self.target = target_name
-        
-    def add_technical_features(self, df, instruments):
-        """
-        Добавляет технические признаки для всех инструментов
+        Добавляет технические признаки (упрощённая версия)
         """
         result = df.copy()
         
-        # Убеждаемся, что instruments - это список строк
-        if isinstance(instruments, str):
-            instruments = [instruments]
+        # Доходности
+        result['return_1'] = result['close'].pct_change()
+        result['return_5'] = result['close'].pct_change(5)
+        result['return_10'] = result['close'].pct_change(10)
         
-        for inst in instruments:
-            # Проверяем, что inst - строка
-            if not isinstance(inst, str):
-                print(f" Пропускаем inst={inst}, тип={type(inst)}")
-                continue
-            
-            close_col = f'{inst}_close'
-            if close_col not in result.columns:
-                print(f" Колонка {close_col} не найдена, пропускаем {inst}")
-                continue
-            
-            # Принудительно преобразуем в float
-            result[close_col] = pd.to_numeric(result[close_col], errors='coerce')
-            
-            # 1. Доходности
-            result[f'{inst}_return_1'] = result[close_col].pct_change()
-            result[f'{inst}_return_5'] = result[close_col].pct_change(5)
-            result[f'{inst}_return_10'] = result[close_col].pct_change(10)
-            result[f'{inst}_return_20'] = result[close_col].pct_change(20)
-            
-            # 2. Логарифмические доходности
-            result[f'{inst}_log_return'] = np.log(result[close_col] / result[close_col].shift(1))
-            
-            # 3. Свечные паттерны
-            open_col = f'{inst}_open'
-            high_col = f'{inst}_high'
-            low_col = f'{inst}_low'
-            
-            if open_col in result.columns and high_col in result.columns and low_col in result.columns:
-                result[open_col] = pd.to_numeric(result[open_col], errors='coerce')
-                result[high_col] = pd.to_numeric(result[high_col], errors='coerce')
-                result[low_col] = pd.to_numeric(result[low_col], errors='coerce')
-                
-                result[f'{inst}_body'] = abs(result[close_col] - result[open_col])
-                result[f'{inst}_range'] = result[high_col] - result[low_col]
-                result[f'{inst}_body_ratio'] = result[f'{inst}_body'] / (result[f'{inst}_range'] + 1e-6)
-            
-            # 4. Скользящие средние
-            for period in [5, 10, 20, 40]:
-                sma = result[close_col].rolling(period).mean()
-                result[f'{inst}_sma_{period}'] = sma
-                result[f'{inst}_dist_to_sma_{period}'] = (result[close_col] / sma - 1) * 100
-            
-            # 5. Волатильность
-            for period in [5, 10, 20]:
-                result[f'{inst}_volatility_{period}'] = result[f'{inst}_return_1'].rolling(period).std() * 100
-            
-            # 6. RSI
-            delta = result[close_col].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            result[f'{inst}_rsi'] = 100 - (100 / (1 + rs))
-            
-            # 7. Объемные признаки
-            volume_col = f'{inst}_volume'
-            if volume_col in result.columns:
-                result[volume_col] = pd.to_numeric(result[volume_col], errors='coerce').fillna(0)
-                result[f'{inst}_volume_ma_10'] = result[volume_col].rolling(10).mean()
-                result[f'{inst}_volume_ratio'] = result[volume_col] / (result[f'{inst}_volume_ma_10'] + 1)
-                result[f'{inst}_volume_zscore'] = (result[volume_col] - result[volume_col].rolling(20).mean()) / (result[volume_col].rolling(20).std() + 1e-6)
-            
-            # 8. Лаги
-            for lag in [1, 2, 3, 5, 10]:
-                result[f'{inst}_return_lag_{lag}'] = result[f'{inst}_return_1'].shift(lag)
-            
-            # Временные признаки
-            if 'datetime' in result.columns:
-                result['hour'] = result['datetime'].dt.hour
-                result['minute'] = result['datetime'].dt.minute
-                result['day_of_week'] = result['datetime'].dt.dayofweek
-                result['day_of_month'] = result['datetime'].dt.day
-            
-            # Удаляем строки с NaN
-            result = result.dropna().reset_index(drop=True)
-            
-            return result
+        # Скользящие средние
+        result['sma_10'] = result['close'].rolling(10, min_periods=5).mean()
+        result['sma_20'] = result['close'].rolling(20, min_periods=10).mean()
+        result['dist_to_sma_10'] = (result['close'] / result['sma_10'] - 1) * 100
+        
+        # Волатильность
+        result['volatility_10'] = result['return_1'].rolling(10, min_periods=5).std() * 100
+        
+        # Лаги
+        for lag in [1, 2, 3, 5]:
+            result[f'close_lag_{lag}'] = result['close'].shift(lag)
+            result[f'return_lag_{lag}'] = result['return_1'].shift(lag)
+        
+        # Объём
+        result['volume_ma_10'] = result['volume'].rolling(10, min_periods=1).mean()
+        result['volume_ratio'] = result['volume'] / (result['volume_ma_10'] + 1)
+        
+        # Временные признаки
+        result['hour'] = result['datetime'].dt.hour
+        result['minute'] = result['datetime'].dt.minute
+        result['day_of_week'] = result['datetime'].dt.dayofweek
+        
+        return result
     
-    def extract_news_features(self, news_df, bar_time, window_minutes):
+    def add_news_features(self, df, news_df, windows=[30, 60, 120, 240]):
         """
-        Извлекает признаки из новостей за окно
+        Добавляет новостные признаки с эмбеддингами
+        Для каждого окна: взвешенный эмбеддинг, интенсивность, сентимент
         """
-        if news_df.empty:
-            return {
-                'count': 0,
-                'sentiment': 0,
-                'minutes_since_last': window_minutes,
-                'urgency': 0,
-                'has_target_mention': 0,
-                'has_russia': 0,
-                'has_economics': 0,
-                'avg_title_len': 0
-            }
-        
-        window_start = bar_time - timedelta(minutes=window_minutes)
-        mask = (news_df['published'] <= bar_time) & (news_df['published'] > window_start)
-        news_window = news_df[mask]
-        
-        if len(news_window) == 0:
-            return {
-                'count': 0,
-                'sentiment': 0,
-                'minutes_since_last': window_minutes,
-                'urgency': 0,
-                'has_target_mention': 0,
-                'has_economics': 0,
-            }
-        
-        # Объединяем текст
-        all_text = ' '.join(news_window['text'].tolist()).lower()
-        all_tags = ' '.join(news_window['tags'].fillna('').tolist()).lower()
-        
-        # Сентимент по ключевым словам
-        pos_words = ['рост', 'вырос', 'увеличился', 'прибыль', 'позитив', 'хороший', 'рекорд', 'дивиденд', 'успех']
-        neg_words = ['падение', 'упал', 'снижение', 'убыток', 'негатив', 'плохой', 'кризис', 'штраф', 'проблема']
-        
-        pos_count = sum(all_text.count(w) for w in pos_words)
-        neg_count = sum(all_text.count(w) for w in neg_words)
-        sentiment = (pos_count - neg_count) / (pos_count + neg_count + 1)
-        
-        # Упоминание целевого инструмента
-        has_target = 1 if (self.target in all_text) else 0
-        
-        # Экономика
-        has_economics = 1 if ('экономика' in all_tags or 'рынок' in all_tags or 'финансы' in all_tags) else 0
-        
-        # Срочность (экспоненциальное затухание)
-        latest_time = news_window['published'].max()
-        minutes_since = (bar_time - latest_time).total_seconds() / 60
-        urgency = np.exp(-minutes_since / 30)
-        
-        return {
-            'count': len(news_window),
-            'sentiment': sentiment,
-            'minutes_since_last': minutes_since,
-            'urgency': urgency,
-            'has_target_mention': has_target,
-            'has_economics': has_economics
-        }
-    
-    def add_news_features(self, df, news_df, windows=[5, 15, 30, 60, 120]):
-        """
-        МАКСИМАЛЬНО БЫСТРАЯ ВЕРСИЯ
-        Использует векторизацию и кумулятивные подсчёты
-        """
-        if news_df is None or news_df.empty:
+        if news_df is None or len(news_df) == 0:
             return df
-    
+        
         result = df.copy()
         news = news_df.copy()
-        news['published'] = pd.to_datetime(news['published'])
         news = news.sort_values('published').reset_index(drop=True)
         
-        # Предварительный расчёт сентимента (один раз)
-        print("  Расчёт сентимента новостей...")
-        pos_words = ['рост', 'вырос', 'увеличился', 'прибыль', 'позитив', 
-                    'хороший', 'рекорд', 'дивиденд', 'успех', 'контракт']
-        neg_words = ['падение', 'упал', 'снижение', 'убыток', 'негатив', 
-                    'плохой', 'кризис', 'штраф', 'проблема', 'риск']
-        
-        texts = news['text'].str.lower().fillna('')
-        pos_counts = texts.apply(lambda x: sum(x.count(w) for w in pos_words))
-        neg_counts = texts.apply(lambda x: sum(x.count(w) for w in neg_words))
-        news['sentiment'] = (pos_counts - neg_counts) / (pos_counts + neg_counts + 1)
-        news['has_sber'] = texts.str.contains('сбер|сбербанк', na=False).astype(int)
-        
-        # Создаём индекс времени для быстрого поиска
-        result = result.sort_values('datetime').reset_index(drop=True)
-        news_times = news['published'].values
-        news_sentiments = news['sentiment'].values
-        news_has_sber = news['has_sber'].values
-        
-        import numpy as np
-        from bisect import bisect_right
-        
-        print("  Агрегация новостей по окнам...")
+        print(f"  Агрегация новостей по окнам {windows}...")
         
         for window in windows:
             print(f"    Окно {window} мин...")
+            window_td = timedelta(minutes=window)
             prefix = f'news_{window}min'
-            window_seconds = window * 60
             
-            counts = np.zeros(len(result), dtype=int)
-            sentiments = np.zeros(len(result))
-            mins_since = np.full(len(result), float(window))
-            has_sber = np.zeros(len(result), dtype=int)
+            # Списки для признаков
+            weighted_embeddings = []
+            total_weights = []
+            max_weights = []
+            weighted_sentiments = []
             
-            for i, row in enumerate(result.itertuples()):
-                bar_time = row.datetime
-                bar_timestamp = bar_time.timestamp()
-                window_start = bar_timestamp - window_seconds
+            for idx, row in result.iterrows():
+                bar_time = row['datetime']
+                window_start = bar_time - window_td
                 
-                # Бинарный поиск границ окна
-                left_idx = bisect_right(news_times, pd.Timestamp.fromtimestamp(window_start)) - 1
-                right_idx = bisect_right(news_times, bar_time) - 1
+                # Новости в окне
+                mask = (news['published'] <= bar_time) & (news['published'] > window_start)
+                news_window = news[mask]
                 
-                if left_idx <= right_idx and left_idx >= 0:
-                    window_news_count = right_idx - left_idx + 1
-                    counts[i] = window_news_count
-                    
-                    # Агрегируем сентимент
-                    window_sentiments = news_sentiments[left_idx:right_idx+1]
-                    sentiments[i] = window_sentiments.mean()
-                    window_has_sber = news_has_sber[left_idx:right_idx+1]
-                    has_sber[i] = window_has_sber.max()
-                    
-                    # Время с последней новости
-                    last_news_time = news_times[right_idx]
-                    mins_since[i] = (bar_time - last_news_time).total_seconds() / 60
+                # Агрегация эмбеддингов
+                w_emb, t_weight, m_weight = self.aggregator.aggregate_embeddings(
+                    news_window, bar_time
+                )
+                weighted_embeddings.append(w_emb)
+                total_weights.append(t_weight)
+                max_weights.append(m_weight)
+                
+                # Агрегация сентимента
+                w_sent, _, _ = self.aggregator.aggregate_sentiment(news_window, bar_time)
+                weighted_sentiments.append(w_sent)
             
-            result[f'{prefix}_count'] = counts
-            result[f'{prefix}_sentiment'] = sentiments
-            result[f'{prefix}_minutes_since_last'] = mins_since
-            result[f'{prefix}_has_sber'] = has_sber
+            # Добавляем эмбеддинги как отдельные признаки (первые 10 компонент PCA)
+            embeddings_array = np.array(weighted_embeddings)
+            
+            # Упрощаем: берём первые 10 компонент через PCA
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=10)
+            embeddings_pca = pca.fit_transform(embeddings_array)
+            
+            for i in range(10):
+                result[f'{prefix}_emb_pca_{i}'] = embeddings_pca[:, i]
+            
+            # Добавляем мета-признаки
+            result[f'{prefix}_total_weight'] = total_weights
+            result[f'{prefix}_max_weight'] = max_weights
+            result[f'{prefix}_sentiment'] = weighted_sentiments
+            result[f'{prefix}_count'] = [len(news[(news['published'] <= bar_time) & 
+                                                   (news['published'] > bar_time - window_td)]) 
+                                         for bar_time in result['datetime']]
         
         return result
     
     def create_target(self, df, up_threshold_pct=0.1, down_threshold_pct=-0.1):
         """
-        Создает целевую переменную для следующей свечи
-        
-        Parameters:
-        -----------
-        up_threshold_pct : float
-            Порог для сигнала UP в процентах (0.1 = 0.1%)
-        down_threshold_pct : float
-            Порог для сигнала DOWN в процентах
+        Создаёт целевую переменную для следующей свечи
         """
         df = df.copy()
         
-        target_close = f'{self.target}_close'
-        if target_close not in df.columns:
-            raise ValueError(f"Колонка {target_close} не найдена")
-        
-        # Будущая доходность
-        future_return = df[target_close].shift(-1) / df[target_close] - 1
-        
-        # Преобразуем проценты в десятичные
         up_threshold = up_threshold_pct / 100
         down_threshold = down_threshold_pct / 100
         
-        # Целевые классы
+        df['future_return'] = df['close'].shift(-1) / df['close'] - 1
         df['target'] = 0
-        df.loc[future_return > up_threshold, 'target'] = 1
-        df.loc[future_return < down_threshold, 'target'] = -1
-        df['future_return'] = future_return
+        df.loc[df['future_return'] > up_threshold, 'target'] = 1
+        df.loc[df['future_return'] < down_threshold, 'target'] = -1
         
         # Убираем последнюю строку
         df = df[:-1].copy()
         
-        print(f"\n Целевые классы для {self.target}:")
+        print(f"\n  Распределение классов для {self.ticker}:")
         for cls in [-1, 0, 1]:
             count = (df['target'] == cls).sum()
             pct = count / len(df) * 100
             name = "DOWN" if cls == -1 else "NEUTRAL" if cls == 0 else "UP"
-            print(f"     {name} ({cls:2d}): {count:6d} ({pct:.2f}%)")
+            print(f"    {name} ({cls:2d}): {count:6d} ({pct:.2f}%)")
         
         return df
 
-class Trainer:
-    """Универсальный тренер для любого инструмента"""
-    
-    def __init__(self, model_params=None):
-        default_params = {
-            'n_estimators': 300,
-            'max_depth': 7,
-            'learning_rate': 0.02,
-            'num_leaves': 31,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'class_weight': 'balanced',
-            'random_state': 42,
-            'verbose': -1
-        }
-        self.params = model_params or default_params
+
+# ============================================================
+# 5. ОБУЧЕНИЕ МОДЕЛИ
+# ============================================================
+
+class ModelTrainer:
+    def __init__(self):
         self.model = None
         self.scaler = StandardScaler()
     
     def train(self, X, y, n_splits=5):
-        """
-        Обучение с временной кросс-валидацией
-        """
         print("\n" + "="*60)
         print("ОБУЧЕНИЕ МОДЕЛИ")
         print("="*60)
@@ -418,31 +342,32 @@ class Trainer:
         tscv = TimeSeriesSplit(n_splits=n_splits)
         X_scaled = self.scaler.fit_transform(X)
         
-        results = {'macro_f1': [], 'accuracy': []}
+        results = []
         all_y_true, all_y_pred = [], []
         
         for fold, (train_idx, val_idx) in enumerate(tscv.split(X_scaled)):
             X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
             
-            model = lgb.LGBMClassifier(**self.params)
+            model = lgb.LGBMClassifier(
+                n_estimators=200,
+                max_depth=5,
+                learning_rate=0.02,
+                class_weight='balanced',
+                random_state=42,
+                verbose=-1
+            )
             model.fit(X_train, y_train)
-            
             y_pred = model.predict(X_val)
             
             macro_f1 = f1_score(y_val, y_pred, average='macro')
-            acc = accuracy_score(y_val, y_pred)
-            
-            results['macro_f1'].append(macro_f1)
-            results['accuracy'].append(acc)
+            results.append(macro_f1)
             all_y_true.extend(y_val)
             all_y_pred.extend(y_pred)
             
-            print(f"  Fold {fold+1}: Macro F1 = {macro_f1:.4f}, Acc = {acc:.4f}")
+            print(f"  Fold {fold+1}: Macro F1 = {macro_f1:.4f}")
         
-        print(f"\n Средние результаты:")
-        print(f"  Macro F1: {np.mean(results['macro_f1']):.4f} (+/- {np.std(results['macro_f1']):.4f})")
-        print(f"  Accuracy: {np.mean(results['accuracy']):.4f} (+/- {np.std(results['accuracy']):.4f})")
+        print(f"\n Средний Macro F1: {np.mean(results):.4f} (+/- {np.std(results):.4f})")
         
         print("\n" + "="*60)
         print("КЛАССИФИКАЦИОННЫЙ ОТЧЕТ")
@@ -451,7 +376,10 @@ class Trainer:
                                      target_names=['DOWN', 'NEUTRAL', 'UP']))
         
         # Финальная модель
-        self.model = lgb.LGBMClassifier(**self.params)
+        self.model = lgb.LGBMClassifier(
+            n_estimators=200, max_depth=5, learning_rate=0.02,
+            class_weight='balanced', random_state=42, verbose=-1
+        )
         self.model.fit(X_scaled, y)
         
         # Важность признаков
@@ -461,91 +389,58 @@ class Trainer:
         }).sort_values('importance', ascending=False)
         
         return results, importance
-    
-    def predict(self, X):
-        """Предсказание для новых данных"""
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict(X_scaled)
-    
-    def predict_proba(self, X):
-        """Вероятности классов"""
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict_proba(X_scaled)
 
-def run_for_target(target_name, 
-                   market_db_path,
-                   news_db_path=None,
-                   table_names=None,
-                   start_date='2025-01-01',
-                   end_date='2025-12-31',
-                   up_threshold=0.1,
-                   down_threshold=-0.1):
-    """
-    Запуск модели для указанного инструмента
+
+# ============================================================
+# 6. MAIN
+# ============================================================
+
+def main():
+    print("="*70)
+    print("МОДЕЛЬ С ЭМБЕДДИНГАМИ НОВОСТЕЙ (SBERT)")
+    print("="*70)
     
-    Parameters:
-    -----------
-    target_name : str
-        Какой инструмент предсказываем ('sber', 'gold', 'imoex', 'usd_rub')
-    market_db_path : str
-        Путь к БД с рыночными данными
-    news_db_path : str or None
-        Путь к БД с новостями
-    table_names : list or None
-        Список таблиц для загрузки (если None - используем стандартные)
-    start_date, end_date : str
-        Период данных
-    up_threshold, down_threshold : float
-        Пороги в процентах
-    """
-    
-    print("\n" + "="*30)
-    print(f"МОДЕЛЬ ДЛЯ {target_name.upper()}")
-    print("="*30)
+    # Пути к файлам
+    MARKET_DB = "/data/market_data_clean.db"
+    NEWS_DB = "/data/ria_news_all_2025.db"
     
     # 1. Загрузка данных
     print("\n ЗАГРУЗКА ДАННЫХ")
-    print("="*30)
+    print("-"*50)
     
-    loader = DataLoader(market_db_path, news_db_path)
-    
-    # Автоматическое определение таблиц, если не указаны
-    if table_names is None:
-        available = loader.list_available_tables()
-        # Ищем таблицы для известных инструментов
-        possible_names = ['sber', 'gold', 'imoex', 'usdrub', 'moex', 'rts', 'usd_rub']
-        table_names = [t for t in available if any(name in t.lower() for name in possible_names)]
-        print(f"  Найдены таблицы: {table_names}")
-    
-    # Загружаем все инструменты
-    merged_df, instruments = loader.load_all_instruments(table_names, start_date, end_date)
-    news_df = loader.load_news(start_date, end_date) if news_db_path else pd.DataFrame()
-    
+    loader = DataLoader(MARKET_DB, NEWS_DB)
+    market_df = loader.load_market_data('sber')
+    news_df_raw = loader.load_news(start_date='2025-01-01', end_date='2025-12-31')
     loader.close()
     
-    # Проверяем, что целевой инструмент загружен
-    if target_name not in instruments:
-        raise ValueError(f"Инструмент {target_name} не найден в загруженных данных. Доступны: {instruments}")
+    print(f"  Рыночные данные: {len(market_df)} свечей")
+    print(f"  Новости: {len(news_df_raw)} записей")
     
-    # 2. Построение признаков
+    # 2. Эмбеддинги новостей
+    print("\n ВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ НОВОСТЕЙ")
+    print("-"*50)
+    
+    embedder = NewsEmbedder('intfloat/multilingual-e5-large')
+    news_df = embedder.get_embeddings_for_news(news_df_raw)
+    
+    # 3. Построение признаков
     print("\n ПОСТРОЕНИЕ ПРИЗНАКОВ")
-    print("="*60)
+    print("-"*50)
     
-    engineer = FeatureBuilder(target_name)
+    builder = FeatureBuilder(ticker='sber')
+    builder.aggregator = WeightedNewsAggregator(decay_minutes=30)
     
-    # Технические признаки
-    print("  Технические индикаторы...")
-    df = engineer.add_technical_features(merged_df, instruments)
+    # Рыночные признаки
+    df = builder.add_market_features(market_df)
     
-    # Новостные признаки
-    if not news_df.empty:
-        df = engineer.add_news_features(df, news_df)
+    # Новостные признаки (с эмбеддингами)
+    df = builder.add_news_features(df, news_df, windows=[30, 60, 120, 240])
     
     # Целевая переменная
-    df = engineer.create_target(df, up_threshold, down_threshold)
+    df = builder.create_target(df, up_threshold_pct=0.1, down_threshold_pct=-0.1)
     
-    # 3. Подготовка к обучению
-    exclude_cols = ['datetime', 'target', 'future_return']
+    # 4. Подготовка к обучению
+    exclude_cols = ['datetime', 'target', 'future_return', 'open', 'high', 'low', 'volume']
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     
     X = df[feature_cols]
@@ -554,94 +449,43 @@ def run_for_target(target_name,
     print(f"\n  Размер выборки: {len(X)} примеров")
     print(f"  Количество признаков: {len(feature_cols)}")
     
-    # 4. Обучение
-    trainer = Trainer()
+    # 5. Обучение
+    trainer = ModelTrainer()
     results, importance = trainer.train(X, y, n_splits=5)
     
-    # 5. Топ признаков
-    print("\n" + "="*60)
-    print("ТОП-20 ВАЖНЫХ ПРИЗНАКОВ")
-    print("="*60)
+    # 6. Топ признаков
+    print("\n" + "="*70)
+    print(" ТОП-30 ВАЖНЫХ ПРИЗНАКОВ")
+    print("="*70)
     
-    for i, row in importance.head(20).iterrows():
-        print(f"{i+1:2d}. {row['feature']:45s} {row['importance']:8.0f}")
+    for i, row in importance.head(30).iterrows():
+        # Подсвечиваем новостные признаки
+        is_news = 'news_' in row['feature']
+        print(f" {row['feature']:40s} {row['importance']:6.0f}")
     
-    # 6. Пример предсказания
-    print("\n" + "="*60)
-    print("ПРИМЕР ПРЕДСКАЗАНИЯ")
-    print("="*60)
+    # 7. Оценка вклада новостей
+    print("\n" + "="*70)
+    print(" ОЦЕНКА ВКЛАДА НОВОСТЕЙ")
+    print("="*70)
     
-    X_scaled = trainer.scaler.transform(X)
-    last_features = X_scaled[-1:].reshape(1, -1)
-    pred = trainer.model.predict(last_features)[0]
-    proba = trainer.model.predict_proba(last_features)[0]
+    news_importance = importance[importance['feature'].str.contains('news_', na=False)]['importance'].sum()
+    total_importance = importance['importance'].sum()
+    news_share = news_importance / total_importance * 100
     
-    signal_map = {-1: 'ПРОДАЖА (прогноз падения)', 
-                  0: 'НЕЙТРАЛЬНО', 
-                  1: 'ПОКУПКА (прогноз роста)'}
+    print(f"  Суммарная важность новостных признаков: {news_share:.1f}%")
+    print(f"  Суммарная важность рыночных признаков: {100 - news_share:.1f}%")
     
-    print(f"Сигнал: {signal_map[pred]}")
-    print(f"Уверенность: {max(proba):.2%}")
-    print("\nВероятности:")
-    print(f"  Падение (-1): {proba[0]:.2%}")
-    print(f"  Нейтрально (0): {proba[1]:.2%}")
-    print(f"  Рост (+1): {proba[2]:.2%}")
+    if news_share > 5:
+        print("\n   Новости дают значимый вклад в предсказания")
+    else:
+        print("\n   Вклад новостей незначителен")
+        print("     Возможные причины:")
+        print("     - Мало релевантных новостей о Сбере")
+        print("     - Окна агрегации не подобраны оптимально")
+        print("     - Нужно больше данных или другой энкодер")
     
-    return trainer, results, importance, df
+    print("\n Модель готова!")
 
 
 if __name__ == "__main__":
-    
-    # ПУТИ К ФАЙЛАМ (ИЗМЕНИТЕ ПОД СЕБЯ)
-    MARKET_DB = "data/market_data_clean.db"
-    NEWS_DB = "data/ria_news_all_2025.db"
-    
-    # Можете запустить для любого инструмента:
-    
-    # 1. Для Сбера
-    print("\n" + "="*30)
-    print("ЗАПУСК ДЛЯ СБЕРА")
-    print("="*30)
-    trainer_sber, _, _, _ = run_for_target(
-        target_name='sber',
-        market_db_path=MARKET_DB,
-        news_db_path=NEWS_DB,
-        start_date='2025-01-01',
-        end_date='2025-12-31'
-    )
-    
-    # 2. Для Золота
-    print("\n" + "="*30)
-    print("ЗАПУСК ДЛЯ ЗОЛОТА")
-    print("="*30)
-    trainer_gold, _, _, _ = run_for_target(
-        target_name='gold',
-        market_db_path=MARKET_DB,
-        news_db_path=NEWS_DB,
-        start_date='2025-01-01',
-        end_date='2025-12-31'
-    )
-    
-    # 3. Для Индекса MOEX
-    print("\n" + "="*30)
-    print("ЗАПУСК ДЛЯ ИНДЕКСА MOEX")
-    print("="*30)
-    trainer_imoex, _, _, _ = run_for_target(
-        target_name='imoex',
-        market_db_path=MARKET_DB,
-        news_db_path=NEWS_DB,
-        start_date='2025-01-01',
-        end_date='2025-12-31'
-    )
-    
-    # 4. Для Доллара/Рубль
-    print("\n" + "="*30)
-    print("ЗАПУСК ДЛЯ ДОЛЛАР/РУБЛЬ")
-    print("="*30)
-    trainer_usdrub, _, _, _ = run_for_target(
-        target_name='usd_rub',
-        market_db_path=MARKET_DB,
-        news_db_path=NEWS_DB,
-        start_date='2025-01-01',
-        end_date='2025-12-31'
-    )
+    main()
