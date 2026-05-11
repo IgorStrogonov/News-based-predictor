@@ -3,8 +3,6 @@
 1. Market-only (только рыночные данные)
 2. News-only (только новости)
 3. Fusion (рынок + новости)
-
-Цель: доказать, что новости добавляют предсказательную силу
 """
 
 import sqlite3
@@ -18,10 +16,8 @@ import warnings
 warnings.filterwarnings('ignore')
 from tqdm import tqdm
 
-# ============================================================
-# 1. ЗАГРУЗКА ДАННЫХ
-# ============================================================
 
+# ЗАГРУЗКА ДАННЫХ
 def load_market_data(db_path, ticker='sber'):
     """Загружает только рыночные данные"""
     conn = sqlite3.connect(db_path)
@@ -52,10 +48,8 @@ def load_news_data(db_path, start_date=None, end_date=None):
     
     return news
 
-# ============================================================
-# 2. ПРИЗНАКИ (единые для всех моделей)
-# ============================================================
 
+# ПРИЗНАКИ (единые для всех моделей)
 def add_market_features(df):
     """Добавляет рыночные признаки"""
     result = df.copy()
@@ -151,10 +145,8 @@ def create_target(df, up_threshold_pct=0.1, down_threshold_pct=-0.1):
     
     return df
 
-# ============================================================
-# 3. ОБУЧЕНИЕ МОДЕЛИ
-# ============================================================
 
+# ОБУЧЕНИЕ МОДЕЛИ
 def train_model(X, y, model_name="Model", n_splits=5):
     """Обучает модель и возвращает Macro F1"""
     print(f"\n{'='*60}")
@@ -206,10 +198,8 @@ def train_model(X, y, model_name="Model", n_splits=5):
     
     return mean_score
 
-# ============================================================
-# 4. ГЛАВНАЯ ФУНКЦИЯ СРАВНЕНИЯ
-# ============================================================
 
+# ФУНКЦИЯ СРАВНЕНИЯ
 def compare_models(market_db_path, news_db_path, ticker='sber'):
     """
     Сравнивает три модели:
@@ -323,10 +313,7 @@ def compare_models(market_db_path, news_db_path, ticker='sber'):
     return results
 
 
-# ============================================================
-# 5. ЗАПУСК
-# ============================================================
-
+# ЗАПУСК
 if __name__ == "__main__":
     MARKET_DB = "data/market_data_clean.db"
     NEWS_DB = "data/ria_news_all_2025.db"

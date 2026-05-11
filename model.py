@@ -13,15 +13,10 @@ import lightgbm as lgb
 import warnings
 warnings.filterwarnings('ignore')
 
-# Установка sentence-transformers если ещё нет
-# pip install sentence-transformers
-
 from sentence_transformers import SentenceTransformer
 
-# ============================================================
-# 1. ЗАГРУЗКА ДАННЫХ
-# ============================================================
 
+# ЗАГРУЗКА ДАННЫХ
 class DataLoader:
     def __init__(self, market_db_path, news_db_path):
         self.market_conn = sqlite3.connect(market_db_path)
@@ -56,10 +51,7 @@ class DataLoader:
         self.news_conn.close()
 
 
-# ============================================================
-# 2. ЭМБЕДДИНГИ НОВОСТЕЙ (SBERT)
-# ============================================================
-
+# ЭМБЕДДИНГИ НОВОСТЕЙ (SBERT)
 class NewsEmbedder:
     """
     Преобразование новостей в эмбеддинги с помощью SBERT
@@ -101,10 +93,8 @@ class NewsEmbedder:
         return news_df
 
 
-# ============================================================
-# 3. ВЗВЕШЕННАЯ АГРЕГАЦИЯ ЭМБЕДДИНГОВ
-# ============================================================
 
+# ВЗВЕШЕННАЯ АГРЕГАЦИЯ ЭМБЕДДИНГОВ
 class WeightedNewsAggregator:
     """
     Агрегирует эмбеддинги новостей с экспоненциальным взвешиванием
@@ -182,10 +172,8 @@ class WeightedNewsAggregator:
         return weighted_sentiment, total_weight, weights.max()
 
 
-# ============================================================
-# 4. ПОСТРОЕНИЕ ПРИЗНАКОВ ДЛЯ МОДЕЛИ
-# ============================================================
 
+# ПОСТРОЕНИЕ ПРИЗНАКОВ ДЛЯ МОДЕЛИ
 class FeatureBuilder:
     """
     Строит признаки для модели: рыночные + новостные (эмбеддинги)
@@ -325,10 +313,7 @@ class FeatureBuilder:
         return df
 
 
-# ============================================================
-# 5. ОБУЧЕНИЕ МОДЕЛИ
-# ============================================================
-
+# ОБУЧЕНИЕ МОДЕЛИ
 class ModelTrainer:
     def __init__(self):
         self.model = None
@@ -391,18 +376,16 @@ class ModelTrainer:
         return results, importance
 
 
-# ============================================================
-# 6. MAIN
-# ============================================================
 
+# MAIN
 def main():
     print("="*70)
     print("МОДЕЛЬ С ЭМБЕДДИНГАМИ НОВОСТЕЙ (SBERT)")
     print("="*70)
     
     # Пути к файлам
-    MARKET_DB = "/data/market_data_clean.db"
-    NEWS_DB = "/data/ria_news_all_2025.db"
+    MARKET_DB = "data/market_data_clean.db"
+    NEWS_DB = "data/ria_news_all_2025.db"
     
     # 1. Загрузка данных
     print("\n ЗАГРУЗКА ДАННЫХ")
