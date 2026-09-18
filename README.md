@@ -70,6 +70,3 @@ python model.py       # полный pipeline с эмбеддингами SBERT 
 python comparator.py  # сравнение Market-only / News-only / Fusion
 ```
 
-## Автор
-
-Проект выполнен в рамках Студенческого научного общества НИЯУ МИФИ.
