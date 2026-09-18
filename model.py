@@ -101,11 +101,17 @@ class WeightedNewsAggregator:
     Более свежие новости имеют больший вес
     """
     
-    def __init__(self, decay_minutes=30):
+    def __init__(self, decay_minutes=30, embedding_dim=None):
         """
         decay_minutes: период полураспада веса (в минутах)
+        embedding_dim: размерность эмбеддингов новостей. Нужна для пустых окон (где новостей
+        не нашлось) - тогда возвращается нулевой вектор именно этой размерности, а не
+        захардкоженной константы, которая может не совпасть с реальной моделью эмбеддингов
+        (например, intfloat/multilingual-e5-large даёт 1024, а не 768). Если не передана явно -
+        FeatureBuilder.add_news_features() выставляет её автоматически по фактическим эмбеддингам.
         """
         self.decay_minutes = decay_minutes
+        self.embedding_dim = embedding_dim
     
     def _get_weights(self, news_times, current_time):
         """
@@ -125,8 +131,16 @@ class WeightedNewsAggregator:
         - максимальный вес (свежесть самой свежей новости)
         """
         if len(news_batch) == 0:
-            # Пустой эмбеддинг (нулевой вектор)
-            return np.zeros(768), 0.0, 0.0
+            # Пустой эмбеддинг (нулевой вектор) - размерность должна совпадать с реальной
+            # моделью эмбеддингов, иначе np.vstack() в вызывающем коде упадёт на несовпадении
+            # форм, как только среди окон попадётся хоть одно без новостей.
+            if self.embedding_dim is None:
+                raise ValueError(
+                    "WeightedNewsAggregator.embedding_dim не задан, а окно новостей пустое - "
+                    "не знаю, какой размерности вернуть нулевой вектор. Передайте embedding_dim "
+                    "в конструктор или выставьте его перед вызовом (см. FeatureBuilder.add_news_features)."
+                )
+            return np.zeros(self.embedding_dim), 0.0, 0.0
         
         embeddings = np.vstack(news_batch['embedding'].values)
         weights = self._get_weights(news_batch['published'], current_time)
@@ -179,10 +193,15 @@ class FeatureBuilder:
     Строит признаки для модели: рыночные + новостные (эмбеддинги)
     """
     
-    def __init__(self, ticker='sber', embedding_dim=768):
+    def __init__(self, ticker='sber', embedding_dim=None):
+        """
+        embedding_dim: можно задать явно, если заранее известна размерность модели эмбеддингов.
+        Если не задать - она будет определена автоматически в add_news_features() по фактическим
+        эмбеддингам новостей, так что при смене модели эмбеддера ничего вручную поправлять не надо.
+        """
         self.ticker = ticker
         self.embedding_dim = embedding_dim
-        self.aggregator = WeightedNewsAggregator(decay_minutes=30)
+        self.aggregator = WeightedNewsAggregator(decay_minutes=30, embedding_dim=embedding_dim)
         self.embedder = None  # будет инициализирован позже
     
     def add_market_features(self, df):
@@ -231,7 +250,16 @@ class FeatureBuilder:
         result = df.copy()
         news = news_df.copy()
         news = news.sort_values('published').reset_index(drop=True)
-        
+
+        # Определяем реальную размерность эмбеддингов по факту (а не по захардкоженной
+        # константе) и сообщаем её агрегатору - нужна для нулевого вектора в пустых окнах.
+        actual_dim = len(news['embedding'].iloc[0])
+        if self.embedding_dim is not None and self.embedding_dim != actual_dim:
+            print(f"  Внимание: embedding_dim={self.embedding_dim} не совпадает с фактической "
+                  f"размерностью эмбеддингов ({actual_dim}). Использую фактическую.")
+        self.embedding_dim = actual_dim
+        self.aggregator.embedding_dim = actual_dim
+
         print(f"  Агрегация новостей по окнам {windows}...")
         
         for window in windows:
@@ -411,8 +439,7 @@ def main():
     print("-"*50)
     
     builder = FeatureBuilder(ticker='sber')
-    builder.aggregator = WeightedNewsAggregator(decay_minutes=30)
-    
+
     # Рыночные признаки
     df = builder.add_market_features(market_df)
     
